@@ -243,13 +243,91 @@ app.get('/api-local/day-sessions/:employeeId/closed', (req, res) => {
   }
 });
 
+app.put('/api-local/day-sessions/:employeeId/events/:eventId', (req, res) => {
+  const { employeeId, eventId } = req.params;
+  const { 
+    locationId = null,
+    locationName = '',
+    issue = null,
+    comment = null,
+    billable = true
+  } = req.body;
+  const date = getTodayDate();
+
+  try {
+    const sessionStmt = db.prepare('SELECT * FROM day_sessions WHERE employee_id = ? AND date = ? AND status = ?');
+    sessionStmt.bind([employeeId, date, 'active']);
+    const session = sessionStmt.step() ? sessionStmt.getAsObject() : null;
+    sessionStmt.free();
+
+    if (!session) {
+      return res.status(404).json({ error: 'No active session found' });
+    }
+
+    const eventStmt = db.prepare('SELECT * FROM activity_events WHERE id = ? AND day_session_id = ?');
+    eventStmt.bind([eventId, session.id]);
+    const event = eventStmt.step() ? eventStmt.getAsObject() : null;
+    eventStmt.free();
+
+    if (!event) {
+      return res.status(404).json({ error: 'Event not found' });
+    }
+
+    if (['pause', 'resume', 'end_day'].includes(event.event_type)) {
+      return res.status(400).json({ error: 'Cannot edit this event type' });
+    }
+
+    db.run(`UPDATE activity_events 
+      SET location_id = ?, location_name = ?, issue = ?, comment = ?, billable = ?
+      WHERE id = ?`,
+      [
+        locationId !== undefined ? locationId : event.location_id,
+        locationName !== undefined ? locationName : event.location_name,
+        issue !== undefined ? issue : event.issue,
+        comment !== undefined ? comment : event.comment,
+        billable !== undefined ? (billable ? 1 : 0) : event.billable,
+        eventId
+      ]);
+
+    saveDb();
+
+    const updatedEventStmt = db.prepare('SELECT * FROM activity_events WHERE id = ?');
+    updatedEventStmt.bind([eventId]);
+    updatedEventStmt.step();
+    const updatedEvent = updatedEventStmt.getAsObject();
+    updatedEventStmt.free();
+
+    const updatedSessionStmt = db.prepare('SELECT * FROM day_sessions WHERE id = ?');
+    updatedSessionStmt.bind([session.id]);
+    updatedSessionStmt.step();
+    const updatedSession = updatedSessionStmt.getAsObject();
+    updatedSessionStmt.free();
+
+    const eventsStmt = db.prepare('SELECT * FROM activity_events WHERE day_session_id = ? ORDER BY timestamp ASC');
+    eventsStmt.bind([session.id]);
+    const events = [];
+    while (eventsStmt.step()) {
+      events.push(eventsStmt.getAsObject());
+    }
+    eventsStmt.free();
+
+    res.json({ session: updatedSession, events });
+  } catch (err) {
+    console.error('Error updating event:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 app.post('/api-local/day-sessions/:employeeId', (req, res) => {
   const { employeeId } = req.params;
   const { 
     itemId, itemName, projectId, projectName, 
     clientId, clientName, 
-    locationId, locationName,
-    issue, comment, billable,
+    locationId = null,
+    locationName = '',
+    issue = null,
+    comment = null,
+    billable = true,
     targetSeconds 
   } = req.body;
   const date = getTodayDate();
@@ -306,8 +384,11 @@ app.put('/api-local/day-sessions/:employeeId/push', (req, res) => {
   const { 
     itemId, itemName, projectId, projectName, 
     clientId, clientName,
-    locationId, locationName,
-    issue, comment, billable
+    locationId = null,
+    locationName = '',
+    issue = null,
+    comment = null,
+    billable = true
   } = req.body;
   const date = getTodayDate();
   const now = new Date().toISOString();
@@ -329,6 +410,32 @@ app.put('/api-local/day-sessions/:employeeId/push', (req, res) => {
 
     if (lastEvent && lastEvent.event_type === 'push') {
       return res.status(400).json({ error: 'Already at a pushed activity. Pop first.' });
+    }
+
+    const lastWorkStmt = db.prepare(`
+      SELECT * FROM activity_events 
+      WHERE day_session_id = ? AND event_type NOT IN ('pause', 'resume', 'end_day')
+      ORDER BY timestamp DESC LIMIT 1
+    `);
+    lastWorkStmt.bind([session.id]);
+    const lastWorkEvent = lastWorkStmt.step() ? lastWorkStmt.getAsObject() : null;
+    lastWorkStmt.free();
+
+    const isLogicallySame = 
+      lastWorkEvent && 
+      lastWorkEvent.item_id === itemId &&
+      (locationId || null) === (lastWorkEvent.location_id) &&
+      (issue || null) === (lastWorkEvent.issue || null) &&
+      (comment || null) === (lastWorkEvent.comment || null) &&
+      (billable !== false ? 1 : 0) === lastWorkEvent.billable;
+
+    if (isLogicallySame) {
+      const eventsStmt = db.prepare('SELECT * FROM activity_events WHERE day_session_id = ? ORDER BY timestamp ASC');
+      eventsStmt.bind([session.id]);
+      const events = [];
+      while (eventsStmt.step()) { events.push(eventsStmt.getAsObject()); }
+      eventsStmt.free();
+      return res.json({ session, events });
     }
 
     let durationSeconds = 0;
@@ -430,6 +537,33 @@ app.put('/api-local/day-sessions/:employeeId/pop', (req, res) => {
     startDayStmt.free();
 
     const returnToItem = startDayEvent || pushEvents[1] || null;
+
+    const currentWorkStmt = db.prepare(`
+      SELECT * FROM activity_events 
+      WHERE day_session_id = ? AND event_type NOT IN ('pause', 'resume', 'end_day', 'pop')
+      ORDER BY timestamp DESC LIMIT 1
+    `);
+    currentWorkStmt.bind([session.id]);
+    const currentWorkEvent = currentWorkStmt.step() ? currentWorkStmt.getAsObject() : null;
+    currentWorkStmt.free();
+
+    const isLogicallySame = 
+      returnToItem &&
+      currentWorkEvent &&
+      returnToItem.item_id === currentWorkEvent.item_id &&
+      (returnToItem.location_id || null) === (currentWorkEvent.location_id || null) &&
+      (returnToItem.issue || null) === (currentWorkEvent.issue || null) &&
+      (returnToItem.comment || null) === (currentWorkEvent.comment || null) &&
+      returnToItem.billable === currentWorkEvent.billable;
+
+    if (isLogicallySame) {
+      const eventsStmt = db.prepare('SELECT * FROM activity_events WHERE day_session_id = ? ORDER BY timestamp ASC');
+      eventsStmt.bind([session.id]);
+      const events = [];
+      while (eventsStmt.step()) { events.push(eventsStmt.getAsObject()); }
+      eventsStmt.free();
+      return res.json({ session, events });
+    }
 
     db.run(`INSERT INTO activity_events 
       (day_session_id, timestamp, event_type, item_id, item_name, project_id, project_name, client_id, client_name, location_id, location_name, issue, comment, billable)
@@ -651,6 +785,25 @@ app.put('/api-local/day-sessions/:employeeId/end', async (req, res) => {
     }
     eventsStmt.free();
 
+    // Merge consecutive logically-same events
+    const mergedEvents = [];
+    for (const event of events) {
+      const last = mergedEvents[mergedEvents.length - 1];
+      const isSame = 
+        last && 
+        last.item_id === event.item_id &&
+        (last.location_id || null) === (event.location_id || null) &&
+        (last.issue || null) === (event.issue || null) &&
+        (last.comment || null) === (event.comment || null) &&
+        last.billable === event.billable;
+      
+      if (isSame) {
+        last.duration_seconds += event.duration_seconds;
+      } else {
+        mergedEvents.push({ ...event });
+      }
+    }
+
     // Calculate start and end times for each entry
     let currentTime = new Date(session.start_time).getTime();
     
@@ -667,7 +820,7 @@ app.put('/api-local/day-sessions/:employeeId/end', async (req, res) => {
       return `${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`;
     };
 
-    const entries = events.map(event => {
+    const entries = mergedEvents.map(event => {
       const startTime = new Date(currentTime);
       const endTime = new Date(currentTime + event.duration_seconds * 1000);
       currentTime = endTime.getTime();
@@ -747,8 +900,11 @@ app.put('/api-local/day-sessions/:employeeId/reopen', (req, res) => {
   const { 
     itemId, itemName, projectId, projectName, 
     clientId, clientName,
-    locationId, locationName,
-    issue, comment, billable
+    locationId = null,
+    locationName = '',
+    issue = null,
+    comment = null,
+    billable = true
   } = req.body || {};
   const date = getTodayDate();
   const now = new Date().toISOString();
