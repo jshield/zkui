@@ -1,4 +1,6 @@
 import { useState, useRef, useEffect, useCallback } from "react";
+import { loadConfig } from "./configService";
+import { requestDeviceCode, pollForToken, refreshAccessToken } from "./authService";
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 const CLIENT_COLORS = ["#FF6B6B","#FF8E53","#FFC857","#A8E6CF","#7EC8E3","#B388FF","#F48FB1","#80DEEA"];
@@ -122,7 +124,7 @@ const CSS = `
 `;
 
 // ─── API client ───────────────────────────────────────────────────────────────
-function makeApi(baseUrl, token) {
+function makeApi(baseUrl, token, sessionRefArg = null, onTokenRefresh = null) {
   const base = baseUrl.replace(/\/$/, "");
   const getHeaders = () => {
     const h = new Headers();
@@ -130,12 +132,27 @@ function makeApi(baseUrl, token) {
     h.append("Authorization", `Bearer ${token}`);
     return h;
   };
-  const req = async (method, path, body) => {
+  const req = async (method, path, body, retryCount = 0) => {
     const res = await fetch(`${base}${path}`, {
       method,
       headers: getHeaders(),
       body: body !== undefined ? JSON.stringify(body) : undefined,
     });
+    
+    if (res.status === 401 && retryCount === 0 && sessionRefArg?.current?.refreshToken && sessionRefArg.current.azureAD && onTokenRefresh) {
+      try {
+        const refreshed = await onTokenRefresh();
+        if (refreshed && sessionRefArg.current) {
+          return req(method, path, body, 1);
+        }
+      } catch (refreshErr) {
+        if (refreshErr.message?.includes('expired') || refreshErr.message?.includes('invalid_grant')) {
+          onTokenRefresh(true);
+        }
+        throw refreshErr;
+      }
+    }
+    
     if (!res.ok) {
       const t = await res.text().catch(() => "");
       throw new Error(`${res.status} ${res.statusText}${t ? ": " + t : ""}`);
@@ -156,6 +173,7 @@ function makeApi(baseUrl, token) {
     getClients:       ()              => req("GET",    `/api/Clients`),
     getProjects:      ()              => req("GET",    `/api/Projects`),
     getItems:         ()              => req("GET",    `/api/Items`),
+    getEmployeeItems: (empId)        => req("GET",    `/employee/${empId}`),
     getLocations:     (empId)         => req("GET",    `/api/Locations?employeeId=${empId}`),
     getFavourites:   (empId)         => req("GET",    `/api/Entries/favourite/${empId}`),
     addFavourite:    (fav)           => req("POST",   `/api/Entries/favourite`, fav),
@@ -165,6 +183,55 @@ function makeApi(baseUrl, token) {
     getLeaves:      (empId)         => req("GET",    `/api/Leaves/${empId}`),
     addLeave:       (empId, leave) => req("POST",   `/api/Leaves/${empId}`, leave),
     deleteLeave:     (id)            => req("DELETE", `/api/Leaves/${id}`),
+  };
+}
+
+function makeLocalApi() {
+  const base = "";
+  return {
+    getDaySession: (employeeId) =>
+      fetch(`${base}/api-local/day-sessions/${employeeId}`).then(r => r.json()),
+    getClosedSession: (employeeId) =>
+      fetch(`${base}/api-local/day-sessions/${employeeId}/closed`).then(r => r.json()),
+    startDay: (employeeId, data) =>
+      fetch(`${base}/api-local/day-sessions/${employeeId}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(data)
+      }).then(r => r.json()),
+    pushActivity: (employeeId, data) =>
+      fetch(`${base}/api-local/day-sessions/${employeeId}/push`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(data)
+      }).then(r => r.json()),
+    popActivity: (employeeId) =>
+      fetch(`${base}/api-local/day-sessions/${employeeId}/pop`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" }
+      }).then(r => r.json()),
+    pauseDay: (employeeId) =>
+      fetch(`${base}/api-local/day-sessions/${employeeId}/pause`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" }
+      }).then(r => r.json()),
+    resumeDay: (employeeId) =>
+      fetch(`${base}/api-local/day-sessions/${employeeId}/resume`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" }
+      }).then(r => r.json()),
+    endDay: (employeeId, authToken) =>
+      fetch(`${base}/api-local/day-sessions/${employeeId}/end`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ authToken })
+      }).then(r => r.json()),
+    reopenDay: (employeeId, data = {}) =>
+      fetch(`${base}/api-local/day-sessions/${employeeId}/reopen`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: Object.keys(data).length > 0 ? JSON.stringify(data) : undefined
+      }).then(r => r.json()),
   };
 }
 
@@ -181,6 +248,13 @@ function LoginScreen({ onLogin }) {
   const [empId,   setEmpId]   = useState("");
   const [loading, setLoading] = useState(false);
   const [error,   setError]   = useState("");
+  const [loginMode, setLoginMode] = useState("token");
+  const [deviceCode, setDeviceCode] = useState(null);
+  const [deviceLoading, setDeviceLoading] = useState(false);
+  const [deviceError, setDeviceError] = useState("");
+  const [deviceSuccess, setDeviceSuccess] = useState(false);
+  const [configLoading, setConfigLoading] = useState(false);
+  const [configError, setConfigError] = useState("");
 
   function sanitizeError(msg) {
     if (!msg) return "Connection failed. Check your URL and token.";
@@ -200,7 +274,7 @@ function LoginScreen({ onLogin }) {
         if (!list || list.length === 0) throw new Error("No employees found. Please specify an Employee ID.");
         employee = list[0];
       }
-      onLogin({ api, employee, baseUrl: url.trim(), token: token.trim() });
+      onLogin({ api: null, employee, baseUrl: url.trim(), accessToken: token.trim(), refreshToken: null, expiresAt: null, azureAD: null });
     } catch (err) {
       setError(sanitizeError(err.message));
     } finally {
@@ -208,46 +282,782 @@ function LoginScreen({ onLogin }) {
     }
   }
 
+  async function handleDeviceLoginStart() {
+    setDeviceError("");
+    setDeviceSuccess(false);
+    setConfigLoading(true);
+    setDeviceLoading(true);
+
+    try {
+      const config = await loadConfig();
+      if (!config || !config.tenantId || !config.clientId || !config.scope) {
+        setConfigError("Could not load Azure AD configuration. Please enter server URL first and try again.");
+        setDeviceLoading(false);
+        setConfigLoading(false);
+        return;
+      }
+
+      const codeResponse = await requestDeviceCode(config.tenantId, config.clientId, config.scope);
+      setDeviceCode(codeResponse);
+
+      pollForDeviceToken(codeResponse, config);
+    } catch (err) {
+      setDeviceError(err.message);
+      setDeviceLoading(false);
+      setConfigLoading(false);
+    }
+  }
+
+  async function pollForDeviceToken(codeResponse, config) {
+    const poll = async () => {
+      try {
+        const tokenResponse = await pollForToken(config.tenantId, config.clientId, codeResponse.device_code);
+
+        if (tokenResponse === null) {
+          setTimeout(poll, (codeResponse.interval || 5) * 1000);
+          return;
+        }
+
+        setDeviceSuccess(true);
+        const expiresAt = Date.now() + (tokenResponse.expires_in * 1000);
+
+        const api = makeApi(url.trim(), tokenResponse.access_token);
+        let employee;
+        if (empId.trim()) {
+          employee = await api.getEmployee(parseInt(empId.trim()));
+        } else {
+          const list = await api.getEmployees();
+          if (!list || list.length === 0) throw new Error("No employees found. Please specify an Employee ID.");
+          employee = list[0];
+        }
+
+        onLogin({
+          api: null,
+          employee,
+          baseUrl: url.trim(),
+          accessToken: tokenResponse.access_token,
+          refreshToken: tokenResponse.refresh_token,
+          expiresAt,
+          azureAD: config
+        });
+      } catch (err) {
+        if (err.message.includes('expired') || err.message.includes('denied')) {
+          setDeviceError(err.message);
+          setDeviceCode(null);
+          setDeviceLoading(false);
+          setConfigLoading(false);
+        } else {
+          setTimeout(poll, (codeResponse.interval || 5) * 1000);
+        }
+      }
+    };
+
+    setTimeout(poll, (codeResponse.interval || 5) * 1000);
+  }
+
+  const canUseDeviceLogin = url.trim() && url.trim() !== "/api" && url.trim().startsWith("http");
+
   return (
     <div className="login-wrap">
       <div className="login-card">
         <div className="login-title">Timesheet</div>
         <div className="login-sub">CONNECT TO YOUR SERVER</div>
         {error && <div className="err-box">{error}</div>}
-        <form onSubmit={handleLogin}>
-          <div className="field-group">
-            <label className="input-label">Server URL</label>
-            <input className="input" value={url} onChange={e => setUrl(e.target.value)}
-              placeholder="https://your-api.azurewebsites.net" required />
-          </div>
-          <div className="field-group">
-            <label className="input-label">Bearer Token</label>
-            <input className="input" type="password" value={token} onChange={e => setToken(e.target.value)}
-              placeholder="Paste your JWT token here" required />
-          </div>
-          <div className="field-group">
-            <label className="input-label">
-              Employee ID&nbsp;
-              <span style={{ color: "#444466", textTransform: "none", letterSpacing: 0 }}>
-                (optional — defaults to first employee)
-              </span>
-            </label>
-            <input className="input" value={empId} onChange={e => setEmpId(e.target.value)} placeholder="e.g. 42" />
-          </div>
-          <button className="btn btn-primary" type="submit" disabled={loading}
-            style={{ width: "100%", padding: "11px", marginTop: 4, fontSize: 12, letterSpacing: ".12em" }}>
-            {loading
-              ? <><span className="spinner" style={{ marginRight: 8 }} />CONNECTING…</>
-              : "CONNECT →"}
+        {configError && <div className="err-box">{configError}</div>}
+        
+        <div style={{ display: "flex", gap: 8, marginBottom: 20 }}>
+          <button
+            type="button"
+            className={`btn ${loginMode === 'token' ? 'btn-primary' : ''}`}
+            onClick={() => { setLoginMode('token'); setDeviceCode(null); setDeviceError(""); }}
+            style={{ flex: 1, fontSize: 10 }}
+          >
+            TOKEN
           </button>
-        </form>
+          <button
+            type="button"
+            className={`btn ${loginMode === 'device' ? 'btn-primary' : ''}`}
+            onClick={() => { setLoginMode('device'); setError(""); }}
+            disabled={!canUseDeviceLogin}
+            style={{ flex: 1, fontSize: 10, opacity: canUseDeviceLogin ? 1 : 0.4 }}
+            title={!canUseDeviceLogin ? "Enter a valid server URL to use device login" : ""}
+          >
+            DEVICE LOGIN
+          </button>
+        </div>
+
+        {loginMode === 'token' ? (
+          <form onSubmit={handleLogin}>
+            <div className="field-group">
+              <label className="input-label">Server URL</label>
+              <input className="input" value={url} onChange={e => setUrl(e.target.value)}
+                placeholder="https://your-api.azurewebsites.net" required />
+            </div>
+            <div className="field-group">
+              <label className="input-label">Bearer Token</label>
+              <input className="input" type="password" value={token} onChange={e => setToken(e.target.value)}
+                placeholder="Paste your JWT token here" required />
+            </div>
+            <div className="field-group">
+              <label className="input-label">
+                Employee ID&nbsp;
+                <span style={{ color: "#444466", textTransform: "none", letterSpacing: 0 }}>
+                  (optional — defaults to first employee)
+                </span>
+              </label>
+              <input className="input" value={empId} onChange={e => setEmpId(e.target.value)} placeholder="e.g. 42" />
+            </div>
+            <button className="btn btn-primary" type="submit" disabled={loading}
+              style={{ width: "100%", padding: "11px", marginTop: 4, fontSize: 12, letterSpacing: ".12em" }}>
+              {loading
+                ? <><span className="spinner" style={{ marginRight: 8 }} />CONNECTING…</>
+                : "CONNECT →"}
+            </button>
+          </form>
+        ) : (
+          <div>
+            <div className="field-group">
+              <label className="input-label">Server URL</label>
+              <input className="input" value={url} onChange={e => setUrl(e.target.value)}
+                placeholder="https://your-api.azurewebsites.net" />
+            </div>
+            <div className="field-group">
+              <label className="input-label">
+                Employee ID&nbsp;
+                <span style={{ color: "#444466", textTransform: "none", letterSpacing: 0 }}>
+                  (optional — defaults to first employee)
+                </span>
+              </label>
+              <input className="input" value={empId} onChange={e => setEmpId(e.target.value)} placeholder="e.g. 42" />
+            </div>
+
+            {deviceError && <div className="err-box" style={{ marginBottom: 16 }}>{deviceError}</div>}
+
+            {!deviceCode ? (
+              <button
+                className="btn btn-primary"
+                onClick={handleDeviceLoginStart}
+                disabled={deviceLoading || configLoading}
+                style={{ width: "100%", padding: "11px", marginTop: 4, fontSize: 12, letterSpacing: ".12em" }}
+              >
+                {configLoading || deviceLoading
+                  ? <><span className="spinner" style={{ marginRight: 8 }} />INITIALIZING…</>
+                  : "START DEVICE LOGIN"}
+              </button>
+            ) : deviceSuccess ? (
+              <div style={{ textAlign: "center", padding: "20px 0" }}>
+                <div style={{ color: "#A8E6CF", fontSize: 24, marginBottom: 12 }}>✓</div>
+                <div style={{ color: "#c0c0d8", fontSize: 12 }}>Successfully authenticated!</div>
+                <div style={{ color: "#555577", fontSize: 11, marginTop: 8 }}>Loading your data…</div>
+              </div>
+            ) : (
+              <div style={{ textAlign: "center", padding: "16px 0" }}>
+                <div style={{ fontSize: 10, color: "#555577", letterSpacing: ".1em", marginBottom: 16, textTransform: "uppercase" }}>
+                  Enter this code at Microsoft
+                </div>
+                <div style={{
+                  fontFamily: "'DM Mono', monospace",
+                  fontSize: 28,
+                  fontWeight: 600,
+                  color: "#e0e0f0",
+                  letterSpacing: "0.15em",
+                  padding: "16px 24px",
+                  background: "rgba(255,255,255,.05)",
+                  borderRadius: 8,
+                  marginBottom: 16,
+                  border: "1px solid rgba(255,255,255,.1)"
+                }}>
+                  {deviceCode.user_code}
+                </div>
+                <div style={{ fontSize: 11, color: "#8888aa", marginBottom: 8 }}>
+                  Go to <strong style={{ color: "#7EC8E3" }}>{deviceCode.verification_uri}</strong>
+                </div>
+                <div style={{ fontSize: 10, color: "#555577" }}>
+                  This code expires in {Math.floor(deviceCode.expires_in / 60)} minutes
+                </div>
+                <div style={{ marginTop: 20 }}>
+                  <span className="spinner" style={{ marginRight: 8 }} />
+                  <span style={{ fontSize: 11, color: "#555577" }}>Waiting for authentication…</span>
+                </div>
+                <button
+                  type="button"
+                  className="btn"
+                  onClick={() => { setDeviceCode(null); setDeviceError(""); }}
+                  style={{ marginTop: 16, fontSize: 10 }}
+                >
+                  CANCEL
+                </button>
+              </div>
+            )}
+          </div>
+        )}
       </div>
     </div>
   );
 }
 
+// ─── Day Tracker Component ─────────────────────────────────────────────────
+function DayTracker({ session, items, onToast }) {
+  const localApi = useRef(makeLocalApi()).current;
+  const [daySession, setDaySession] = useState(null);
+  const [events, setEvents] = useState([]);
+  const [remainingSeconds, setRemainingSeconds] = useState(0);
+  const [isPaused, setIsPaused] = useState(false);
+  const [showPicker, setShowPicker] = useState(false);
+  const [loading, setLoading] = useState(false);
+  const [showSummary, setShowSummary] = useState(false);
+  const [summaryData, setSummaryData] = useState(null);
+  const [employeeItems, setEmployeeItems] = useState([]);
+  const [closedSession, setClosedSession] = useState(null);
+  const [showResumeOptions, setShowResumeOptions] = useState(false);
+
+  const employeeId = session.employee.id;
+  const assignedHours = session.employee.assignedHoursPerWeek || 40;
+  const dailySeconds = Math.floor((assignedHours / 5) * 3600);
+
+  useEffect(() => {
+    loadSession();
+    loadEmployeeItems();
+  }, [employeeId]);
+
+  async function loadEmployeeItems() {
+    try {
+      const items = await session.api.getEmployeeItems(employeeId);
+      setEmployeeItems(items || []);
+    } catch (err) {
+      console.error('Failed to load employee items:', err);
+      setEmployeeItems([]);
+    }
+  }
+
+  useEffect(() => {
+    if (!daySession || daySession.session?.status !== 'active' || isPaused) return;
+    
+    const interval = setInterval(() => {
+      const events = daySession.events || [];
+      const lastWorkEvent = [...events].reverse().find(e => 
+        e.event_type === 'start_day' || e.event_type === 'push' || e.event_type === 'pop'
+      );
+      
+      if (!lastWorkEvent) return;
+      
+      const lastWorkTime = new Date(lastWorkEvent.timestamp).getTime();
+      const now = Date.now();
+      const secondsSinceLastWork = Math.floor((now - lastWorkTime) / 1000);
+      
+      const totalWorked = daySession.session.total_worked_seconds || 0;
+      const currentSessionSeconds = totalWorked + secondsSinceLastWork;
+      const remaining = dailySeconds - currentSessionSeconds;
+      
+      setRemainingSeconds(remaining);
+    }, 1000);
+    
+    return () => clearInterval(interval);
+  }, [daySession, isPaused, dailySeconds]);
+
+  async function loadSession() {
+    try {
+      const data = await localApi.getDaySession(employeeId);
+      if (data?.session) {
+        setDaySession(data);
+        setEvents(data.events || []);
+        setClosedSession(null);
+        const lastEvent = data.events?.[data.events.length - 1];
+        setIsPaused(lastEvent?.event_type === 'pause');
+        
+        if (data.session.status === 'active') {
+          const events = data.events || [];
+          const lastWorkEvent = [...events].reverse().find(e => 
+            e.event_type === 'start_day' || e.event_type === 'push' || e.event_type === 'pop'
+          );
+          
+          if (lastWorkEvent) {
+            const lastWorkTime = new Date(lastWorkEvent.timestamp).getTime();
+            const now = Date.now();
+            const secondsSinceLastWork = Math.floor((now - lastWorkTime) / 1000);
+            const totalWorked = data.session.total_worked_seconds || 0;
+            const currentSessionSeconds = totalWorked + secondsSinceLastWork;
+            const remaining = dailySeconds - currentSessionSeconds;
+            setRemainingSeconds(remaining);
+          }
+        }
+      } else {
+        setDaySession(null);
+        setEvents([]);
+        setRemainingSeconds(dailySeconds);
+        
+        const closedData = await localApi.getClosedSession(employeeId);
+        if (closedData?.session) {
+          setClosedSession(closedData);
+        } else {
+          setClosedSession(null);
+        }
+      }
+    } catch (err) {
+      console.error('Failed to load session:', err);
+    }
+  }
+
+  async function handleStartDay(item) {
+    setLoading(true);
+    try {
+      const data = await localApi.startDay(employeeId, {
+        itemId: item.id,
+        itemName: item.name,
+        projectId: item.projectId,
+        projectName: item.projectName,
+        clientId: item.clientId,
+        clientName: item.clientName,
+        targetSeconds: dailySeconds
+      });
+      setDaySession(data);
+      setEvents(data.events || []);
+      setRemainingSeconds(dailySeconds);
+      setIsPaused(false);
+      setShowPicker(false);
+      onToast?.("Day started!", "ok");
+    } catch (err) {
+      onToast?.(err.message, "err");
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function handleResumeSwitch() {
+    setShowResumeOptions(true);
+  }
+
+  async function handleResumeContinue() {
+    setLoading(true);
+    setShowResumeOptions(false);
+    try {
+      const reopenData = await localApi.reopenDay(employeeId);
+      
+      const popData = await localApi.popActivity(employeeId);
+      
+      setDaySession(popData);
+      setEvents(popData.events || []);
+      setClosedSession(null);
+      setIsPaused(false);
+      
+      const events = popData.events || [];
+      const lastWorkEvent = [...events].reverse().find(e => 
+        e.event_type === 'start_day' || e.event_type === 'push' || e.event_type === 'pop' || e.event_type === 'reopen_day'
+      );
+      
+      if (lastWorkEvent) {
+        const lastWorkTime = new Date(lastWorkEvent.timestamp).getTime();
+        const now = Date.now();
+        const secondsSinceLastWork = Math.floor((now - lastWorkTime) / 1000);
+        const totalWorked = popData.session.total_worked_seconds || 0;
+        const currentSessionSeconds = totalWorked + secondsSinceLastWork;
+        const remaining = dailySeconds - currentSessionSeconds;
+        setRemainingSeconds(remaining);
+      }
+      
+      onToast?.("Session resumed!", "ok");
+    } catch (err) {
+      onToast?.(err.message, "err");
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function handleResumeSwitchToItem(item) {
+    setLoading(true);
+    try {
+      const data = await localApi.reopenDay(employeeId, {
+        itemId: item.id,
+        itemName: item.name,
+        projectId: item.projectId,
+        projectName: item.projectName,
+        clientId: item.clientId,
+        clientName: item.clientName
+      });
+      setDaySession(data);
+      setEvents(data.events || []);
+      setClosedSession(null);
+      setShowResumeOptions(false);
+      setShowPicker(false);
+      setIsPaused(false);
+      
+      const events = data.events || [];
+      const lastWorkEvent = [...events].reverse().find(e => 
+        e.event_type === 'start_day' || e.event_type === 'push' || e.event_type === 'pop' || e.event_type === 'reopen_day'
+      );
+      
+      if (lastWorkEvent) {
+        const lastWorkTime = new Date(lastWorkEvent.timestamp).getTime();
+        const now = Date.now();
+        const secondsSinceLastWork = Math.floor((now - lastWorkTime) / 1000);
+        const totalWorked = data.session.total_worked_seconds || 0;
+        const currentSessionSeconds = totalWorked + secondsSinceLastWork;
+        const remaining = dailySeconds - currentSessionSeconds;
+        setRemainingSeconds(remaining);
+      }
+      
+      onToast?.("Session resumed with new activity!", "ok");
+    } catch (err) {
+      onToast?.(err.message, "err");
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function handlePush(item) {
+    setLoading(true);
+    try {
+      const data = await localApi.pushActivity(employeeId, {
+        itemId: item.id,
+        itemName: item.name,
+        projectId: item.projectId,
+        projectName: item.projectName,
+        clientId: item.clientId,
+        clientName: item.clientName
+      });
+      setDaySession(data);
+      setEvents(data.events || []);
+      setShowPicker(false);
+      onToast?.("Switched to " + item.name, "ok");
+    } catch (err) {
+      onToast?.(err.message, "err");
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function handlePop() {
+    setLoading(true);
+    try {
+      const data = await localApi.popActivity(employeeId);
+      setDaySession(data);
+      setEvents(data.events || []);
+      onToast?.("Returned to previous activity", "ok");
+    } catch (err) {
+      onToast?.(err.message, "err");
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function handlePause() {
+    setLoading(true);
+    try {
+      const data = await localApi.pauseDay(employeeId);
+      setDaySession(data);
+      setEvents(data.events || []);
+      setIsPaused(true);
+      onToast?.("Break started", "ok");
+    } catch (err) {
+      onToast?.(err.message, "err");
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function handleResume() {
+    setLoading(true);
+    try {
+      const data = await localApi.resumeDay(employeeId);
+      setDaySession(data);
+      setEvents(data.events || []);
+      setIsPaused(false);
+      onToast?.("Break ended", "ok");
+    } catch (err) {
+      onToast?.(err.message, "err");
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function handleEndDay() {
+    if (!confirm("End your day and generate time entries?")) return;
+    setLoading(true);
+    try {
+      const data = await localApi.endDay(employeeId, session.accessToken);
+      setSummaryData(data);
+      setShowSummary(true);
+      setDaySession(null);
+      setEvents([]);
+      setRemainingSeconds(dailySeconds);
+      onToast?.("Day ended! Entries generated.", "ok");
+    } catch (err) {
+      onToast?.(err.message, "err");
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  const formatTime = (secs) => {
+    const isNegative = secs < 0;
+    const absSecs = Math.abs(secs);
+    const h = Math.floor(absSecs / 3600);
+    const m = Math.floor((absSecs % 3600) / 60);
+    const s = absSecs % 60;
+    const formatted = `${h}:${m.toString().padStart(2, '0')}:${s.toString().padStart(2, '0')}`;
+    return isNegative ? `-${formatted}` : formatted;
+  };
+
+  const getCurrentActivity = () => {
+    if (!events.length) return null;
+    const nonBreakEvents = events.filter(e => 
+      e.event_type !== 'pause' && e.event_type !== 'resume' && e.event_type !== 'end_day'
+    );
+    return nonBreakEvents[nonBreakEvents.length - 1];
+  };
+
+  const currentActivity = getCurrentActivity();
+  const hasPushes = events.filter(e => e.event_type === 'push').length > 0;
+
+  const styles = {
+    wrapper: {
+      background: 'rgba(255,255,255,.03)',
+      border: '1px solid rgba(255,255,255,.08)',
+      borderRadius: 8,
+      padding: 16,
+      marginBottom: 20,
+      position: 'relative',
+    },
+    header: {
+      display: 'flex',
+      justifyContent: 'space-between',
+      alignItems: 'center',
+      marginBottom: 12,
+    },
+    title: {
+      fontSize: 11,
+      letterSpacing: '.15em',
+      color: '#555577',
+      textTransform: 'uppercase',
+    },
+    timer: {
+      fontFamily: "'DM Mono', monospace",
+      fontSize: 32,
+      fontWeight: 500,
+      color: remainingSeconds < 0 ? '#FF6B6B' : (remainingSeconds < 3600 ? '#FF6B6B' : '#e0e0f0'),
+    },
+    activity: {
+      fontSize: 14,
+      color: '#c0c0d8',
+      marginBottom: 4,
+    },
+    project: {
+      fontSize: 11,
+      color: '#555577',
+    },
+    buttons: {
+      display: 'flex',
+      gap: 8,
+      marginTop: 12,
+    },
+    picker: {
+      position: 'absolute',
+      top: '100%',
+      left: 0,
+      right: 0,
+      background: '#13131f',
+      border: '1px solid rgba(255,255,255,.1)',
+      borderRadius: 6,
+      maxHeight: 300,
+      overflowY: 'auto',
+      zIndex: 50,
+      marginTop: 4,
+    },
+    pickerItem: {
+      padding: '10px 14px',
+      cursor: 'pointer',
+      borderBottom: '1px solid rgba(255,255,255,.04)',
+      display: 'flex',
+      justifyContent: 'space-between',
+    },
+  };
+
+  const handleStartDayClick = () => {
+    setShowPicker(true);
+  };
+
+  if (!daySession) {
+    return (
+      <div style={styles.wrapper}>
+        <div style={styles.header}>
+          <span style={styles.title}>Day Tracker</span>
+        </div>
+        <div style={{ textAlign: 'center', padding: '20px 0' }}>
+          <div style={{ fontSize: 12, color: '#555577', marginBottom: 16 }}>
+            {closedSession ? 'Continue where you left off?' : 'Start your day to track time'}
+          </div>
+          {closedSession && !showResumeOptions ? (
+            <button
+              className="btn btn-primary"
+              onClick={() => setShowResumeOptions(true)}
+              disabled={loading}
+              style={{ padding: '10px 24px' }}
+            >
+              RESUME TODAY'S SESSION
+            </button>
+          ) : closedSession && showResumeOptions ? (
+            <div style={{ display: 'flex', gap: 8, justifyContent: 'center' }}>
+              <button
+                className="btn"
+                onClick={handleResumeContinue}
+                disabled={loading}
+                style={{ padding: '10px 16px' }}
+              >
+                CONTINUE
+              </button>
+              <button
+                className="btn btn-primary"
+                onClick={() => { setShowPicker(true); }}
+                disabled={loading}
+                style={{ padding: '10px 16px' }}
+              >
+                SWITCH
+              </button>
+            </div>
+          ) : (
+            <button
+              className="btn btn-primary"
+              onClick={handleStartDayClick}
+              disabled={loading}
+              style={{ padding: '10px 24px' }}
+            >
+              START DAY
+            </button>
+          )}
+        </div>
+        {showPicker && (
+          <div style={styles.picker}>
+            {employeeItems.map(item => (
+              <div
+                key={item.id}
+                style={styles.pickerItem}
+                onClick={() => closedSession ? handleResumeSwitchToItem(item) : handleStartDay(item)}
+                onMouseEnter={(e) => e.currentTarget.style.background = 'rgba(255,255,255,.05)'}
+                onMouseLeave={(e) => e.currentTarget.style.background = 'transparent'}
+              >
+                <span style={{ color: '#c0c0d8', fontSize: 12 }}>{item.name}</span>
+                <span style={{ color: '#555577', fontSize: 10 }}>{item.projectName}</span>
+              </div>
+            ))}
+            {employeeItems.length === 0 && (
+              <div style={{ padding: '10px 14px', color: '#555577', fontSize: 11 }}>
+                No items available
+              </div>
+            )}
+            <div style={{ ...styles.pickerItem, justifyContent: 'center', color: '#555577' }}
+                 onClick={() => { setShowPicker(false); setShowResumeOptions(false); }}>
+              Cancel
+            </div>
+          </div>
+        )}
+      </div>
+    );
+  }
+
+  if (showSummary && summaryData) {
+    return (
+      <div style={styles.wrapper}>
+        <div style={styles.header}>
+          <span style={styles.title}>Day Summary</span>
+          <button className="btn" onClick={() => setShowSummary(false)} style={{ padding: '4px 10px' }}>✕</button>
+        </div>
+        <div style={{ fontSize: 12, color: '#8888aa', marginBottom: 12 }}>
+          {summaryData.entries?.length || 0} entries generated
+        </div>
+        {summaryData.entries?.map((entry, idx) => (
+          <div key={idx} style={{ 
+            padding: '8px 12px', 
+            background: 'rgba(255,255,255,.03)', 
+            borderRadius: 4, 
+            marginBottom: 6,
+            fontSize: 11,
+            color: '#c0c0d8'
+          }}>
+            {entry.itemName} - {Math.round(entry.duration_seconds / 3600 * 10) / 10}h
+          </div>
+        ))}
+      </div>
+    );
+  }
+
+  return (
+    <div style={styles.wrapper}>
+      <div style={styles.header}>
+        <span style={styles.title}>Day Tracker</span>
+        <div style={{ fontSize: 10, color: isPaused ? '#FFC857' : '#A8E6CF' }}>
+          {isPaused ? 'PAUSED' : 'ACTIVE'}
+        </div>
+      </div>
+      
+      <div style={{ textAlign: 'center', marginBottom: 16 }}>
+        <div style={styles.timer}>{formatTime(remainingSeconds)}</div>
+        {remainingSeconds < 0 && (
+          <div style={{ fontSize: 10, color: '#FF6B6B', marginTop: 4, letterSpacing: '.1em' }}>
+            OVERTIME
+          </div>
+        )}
+        {currentActivity && (
+          <>
+            <div style={styles.activity}>{currentActivity.item_name}</div>
+            <div style={styles.project}>{currentActivity.project_name}</div>
+          </>
+        )}
+      </div>
+
+      <div style={styles.buttons}>
+        {isPaused ? (
+          <button className="btn btn-primary" onClick={handleResume} disabled={loading} style={{ flex: 1 }}>
+            RESUME
+          </button>
+        ) : (
+          <button className="btn" onClick={handlePause} disabled={loading} style={{ flex: 1 }}>
+            BREAK
+          </button>
+        )}
+        {hasPushes && (
+          <button className="btn" onClick={handlePop} disabled={loading} style={{ flex: 1 }}>
+            BACK
+          </button>
+        )}
+        <button className="btn" onClick={() => setShowPicker(!showPicker)} disabled={loading} style={{ flex: 1 }}>
+          SWITCH
+        </button>
+        <button className="btn btn-danger" onClick={handleEndDay} disabled={loading} style={{ flex: 1 }}>
+          END
+        </button>
+      </div>
+
+      {showPicker && (
+        <div style={styles.picker}>
+          {employeeItems.map(item => (
+            <div
+              key={item.id}
+              style={styles.pickerItem}
+              onClick={() => handlePush(item)}
+              onMouseEnter={(e) => e.currentTarget.style.background = 'rgba(255,255,255,.05)'}
+              onMouseLeave={(e) => e.currentTarget.style.background = 'transparent'}
+            >
+              <span style={{ color: '#c0c0d8', fontSize: 12 }}>{item.name}</span>
+              <span style={{ color: '#555577', fontSize: 10 }}>{item.projectName}</span>
+            </div>
+          ))}
+          {employeeItems.length === 0 && (
+            <div style={{ padding: '10px 14px', color: '#555577', fontSize: 11 }}>
+              No items available
+            </div>
+          )}
+          <div style={{ ...styles.pickerItem, justifyContent: 'center', color: '#555577' }}
+               onClick={() => setShowPicker(false)}>
+            Cancel
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
 // ─── Entry Modal ──────────────────────────────────────────────────────────────
-function EntryModal({ entry, timesheetId, refDate, api, clients, projects, items, locations, favourites, session, onSave, onSaveFavourite, onDeleteFavourite, onClose }) {
+function EntryModal({ entry, timesheetId, refDate, api, clients, projects, items, locations, favourites, onSave, onSaveFavourite, onClose }) {
   const editing = !!entry?.id;
   const dateStr = todayPrefix(refDate);
 
@@ -536,6 +1346,7 @@ function LeaveModal({ leaveTypes, onSave, onClose }) {
 // ─── Main App ─────────────────────────────────────────────────────────────────
 export default function App() {
   const [session,    setSession]    = useState(null);
+  const sessionRef = useRef(null);
   const [timesheet,  setTimesheet]  = useState(null);
   const [refDate,    setRefDate]    = useState(new Date());
   const [viewMode,   setViewMode]   = useState('day');
@@ -554,6 +1365,57 @@ export default function App() {
   const [favourites, setFavourites] = useState([]);
   const [leaveEntries, setLeaveEntries] = useState([]);
   const [leaveTypes, setLeaveTypes] = useState([]);
+  const [refreshing, setRefreshing] = useState(false);
+
+  useEffect(() => {
+    sessionRef.current = session;
+  }, [session]);
+
+  const refreshToken = useCallback(async () => {
+    const s = sessionRef.current;
+    if (!s?.refreshToken || !s?.azureAD || refreshing) return false;
+    
+    setRefreshing(true);
+    try {
+      const { tenantId, clientId, scope } = s.azureAD;
+      const tokenResponse = await refreshAccessToken(s.refreshToken, tenantId, clientId, scope);
+      
+      const newSession = {
+        ...s,
+        accessToken: tokenResponse.access_token,
+        refreshToken: tokenResponse.refresh_token || s.refreshToken,
+        expiresAt: Date.now() + (tokenResponse.expires_in * 1000),
+        api: makeApi(s.baseUrl, tokenResponse.access_token)
+      };
+      
+      setSession(newSession);
+      return true;
+    } catch (err) {
+      console.error('Token refresh failed:', err);
+      setSession(null);
+      return false;
+    } finally {
+      setRefreshing(false);
+    }
+  }, [refreshing]);
+
+  useEffect(() => {
+    if (!session?.refreshToken || !session?.expiresAt || !session?.azureAD) return;
+    
+    const checkAndRefresh = () => {
+      const now = Date.now();
+      const expiresAt = session.expiresAt;
+      const timeToExpire = expiresAt - now;
+      
+      if (timeToExpire <= 5 * 60 * 1000 && timeToExpire > 0) {
+        refreshToken();
+      }
+    };
+    
+    checkAndRefresh();
+    const interval = setInterval(checkAndRefresh, 60000);
+    return () => clearInterval(interval);
+  }, [session?.refreshToken, session?.expiresAt, session?.azureAD, refreshToken]);
 
   const showToast = (msg, type = "ok") => setToast({ msg, type });
 
@@ -627,11 +1489,43 @@ export default function App() {
     }
   }
 
+  const handleLogin = useCallback((loginData) => {
+    const { api: _existingApi, ...rest } = loginData;
+    const newSession = {
+      ...rest,
+      api: makeApi(rest.baseUrl, rest.accessToken, sessionRef, async () => {
+        const s = sessionRef.current;
+        if (!s?.refreshToken || !s?.azureAD) return false;
+        
+        try {
+          const { tenantId, clientId, scope } = s.azureAD;
+          const tokenResponse = await refreshAccessToken(s.refreshToken, tenantId, clientId, scope);
+          
+          const updated = {
+            ...s,
+            accessToken: tokenResponse.access_token,
+            refreshToken: tokenResponse.refresh_token || s.refreshToken,
+            expiresAt: Date.now() + (tokenResponse.expires_in * 1000),
+            api: makeApi(s.baseUrl, tokenResponse.access_token, sessionRef, handleLogin)
+          };
+          
+          setSession(updated);
+          return true;
+        } catch (err) {
+          console.error('Token refresh failed:', err);
+          setSession(null);
+          return false;
+        }
+      })
+    };
+    setSession(newSession);
+  }, []);
+
   // ── Not logged in ──
   if (!session) return (
     <>
       <style>{CSS}</style>
-      <LoginScreen onLogin={setSession} />
+      <LoginScreen onLogin={handleLogin} />
     </>
   );
 
@@ -690,7 +1584,7 @@ export default function App() {
 
   const pct    = timesheet ? Math.min((timesheet.percentageWorked ?? 0) * 100, 100) : 0;
   const pctClr = pct >= 100 ? "#A8E6CF" : pct >= 75 ? "#7EC8E3" : "#FFC857";
-  const uniqueClients = [...new Set(entries.filter(e => !e.breakTime && e.clientName).map(e => e.clientName))];
+  const _uniqueClients = [...new Set(entries.filter(e => !e.breakTime && e.clientName).map(e => e.clientName))];
   const sortedEntries = [...laned].sort((a, b) => new Date(a.startTime) - new Date(b.startTime));
 
   const statusLabel = timesheet?.approved ? "APPROVED" : timesheet?.submitted ? "SUBMITTED" : "DRAFT";
@@ -760,6 +1654,17 @@ export default function App() {
                 </span>
               )}
             </div>
+          </div>
+        )}
+
+        {/* ── Day Tracker ── */}
+        {session && (
+          <div style={{ padding: "0 40px", borderBottom: "1px solid rgba(255,255,255,.05)" }}>
+            <DayTracker
+              session={session}
+              items={items}
+              onToast={(msg, type) => showToast(msg, type)}
+            />
           </div>
         )}
 
@@ -1038,7 +1943,6 @@ export default function App() {
             items={items}
             locations={locations}
             favourites={favourites}
-            session={session}
             onSave={async () => {
               setModal(null);
               showToast(modal === "add" ? "Entry added!" : "Entry updated.", "ok");
@@ -1049,11 +1953,6 @@ export default function App() {
               const favs = await session.api.getFavourites(session.employee.id);
               setFavourites(favs || []);
               showToast("Favourite saved!", "ok");
-            }}
-            onDeleteFavourite={async (id) => {
-              await session.api.deleteFavourite(id);
-              setFavourites(favourites.filter(f => f.id !== id));
-              showToast("Favourite deleted.", "ok");
             }}
             onClose={() => setModal(null)}
           />

@@ -11,6 +11,7 @@
     "start": "node server.cjs"
   },
   "dependencies": {
+    "sql.js": "^1.11.0",
     "express": "^5.2.1",
     "express-http-proxy": "^2.1.2",
     "http-proxy-middleware": "^3.0.5",
