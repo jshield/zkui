@@ -651,7 +651,8 @@ function DayTracker({ session, items, onToast }) {
         projectName: item.projectName,
         clientId: item.clientId,
         clientName: item.clientName,
-        targetSeconds: dailySeconds
+        targetSeconds: dailySeconds,
+        timezoneOffset: -new Date().getTimezoneOffset()
       });
       setDaySession(data);
       setEvents(data.events || []);
@@ -674,7 +675,7 @@ function DayTracker({ session, items, onToast }) {
     setLoading(true);
     setShowResumeOptions(false);
     try {
-      const reopenData = await localApi.reopenDay(employeeId);
+      const reopenData = await localApi.reopenDay(employeeId, { timezoneOffset: -new Date().getTimezoneOffset() });
       
       const popData = await localApi.popActivity(employeeId);
       
@@ -715,7 +716,8 @@ function DayTracker({ session, items, onToast }) {
         projectId: item.projectId,
         projectName: item.projectName,
         clientId: item.clientId,
-        clientName: item.clientName
+        clientName: item.clientName,
+        timezoneOffset: -new Date().getTimezoneOffset()
       });
       setDaySession(data);
       setEvents(data.events || []);
@@ -1607,8 +1609,8 @@ function EntryModal({ entry, timesheetId, refDate, api, clients, projects, items
         adminComment:    null,
         billable:        form.billable,
         breakTime:       form.breakTime,
-        startTime:       new Date(form.startTime).toISOString(),
-        endTime:         new Date(form.endTime).toISOString(),
+        startTime:       form.startTime,
+        endTime:         form.endTime,
         duration:        "00:00:00",
         unallocatedTime: false,
         clientId:        form.clientId   ? parseInt(form.clientId)   : null,
@@ -2103,7 +2105,7 @@ export default function App() {
             {timesheet && <>
               <div className="stat-pill">Expected<span>{timesheet.expectedHours}h</span></div>
               <div className="stat-pill">Logged<span>{(timesheet.totalHours ?? 0).toFixed(2)}h</span></div>
-              <div className="stat-pill">Coverage<span>{(timesheet.percentageWorked ?? 0).toFixed(0)}%</span></div>
+              <div className="stat-pill">Coverage<span>{Math.min((timesheet.percentageWorked ?? 0) * 100, 100).toFixed(0)}%</span></div>
             </>}
             <button className="btn btn-primary" onClick={() => setModal("add")} style={{ marginLeft: 8 }}>+ ADD ENTRY</button>
             <button className="btn" onClick={() => setModal("addLeave")} style={{ marginLeft: 4 }}>+ ADD LEAVE</button>

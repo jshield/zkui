@@ -38,6 +38,7 @@ async function initDb() {
       status TEXT DEFAULT 'active',
       target_seconds INTEGER NOT NULL,
       total_worked_seconds INTEGER DEFAULT 0,
+      timezone_offset INTEGER,
       created_at TEXT DEFAULT CURRENT_TIMESTAMP,
       UNIQUE(employee_id, date)
     )
@@ -328,7 +329,8 @@ app.post('/api-local/day-sessions/:employeeId', (req, res) => {
     issue = null,
     comment = null,
     billable = true,
-    targetSeconds 
+    targetSeconds,
+    timezoneOffset = null
   } = req.body;
   const date = getTodayDate();
   const now = new Date().toISOString();
@@ -343,8 +345,8 @@ app.post('/api-local/day-sessions/:employeeId', (req, res) => {
       return res.status(400).json({ error: 'Active session already exists for today' });
     }
 
-    db.run('INSERT INTO day_sessions (employee_id, date, start_time, status, target_seconds) VALUES (?, ?, ?, ?, ?)',
-      [employeeId, date, now, 'active', targetSeconds]);
+    db.run('INSERT INTO day_sessions (employee_id, date, start_time, status, target_seconds, timezone_offset) VALUES (?, ?, ?, ?, ?, ?)',
+      [employeeId, date, now, 'active', targetSeconds, timezoneOffset]);
 
     const lastIdStmt = db.prepare('SELECT last_insert_rowid() as id');
     lastIdStmt.step();
@@ -809,6 +811,8 @@ app.put('/api-local/day-sessions/:employeeId/end', async (req, res) => {
     
     const formatDateTime = (timestamp) => {
       const d = new Date(timestamp);
+      const tzOffset = session.timezone_offset ?? d.getTimezoneOffset();
+      d.setMinutes(d.getMinutes() + tzOffset);
       const pad = (n) => String(n).padStart(2, '0');
       return `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
     };
@@ -904,7 +908,8 @@ app.put('/api-local/day-sessions/:employeeId/reopen', (req, res) => {
     locationName = '',
     issue = null,
     comment = null,
-    billable = true
+    billable = true,
+    timezoneOffset = null
   } = req.body || {};
   const date = getTodayDate();
   const now = new Date().toISOString();
@@ -919,7 +924,8 @@ app.put('/api-local/day-sessions/:employeeId/reopen', (req, res) => {
       return res.status(404).json({ error: 'No closed session found for today' });
     }
 
-    db.run('UPDATE day_sessions SET status = ?, end_time = NULL WHERE id = ?', ['active', session.id]);
+    db.run('UPDATE day_sessions SET status = ?, end_time = NULL, timezone_offset = ? WHERE id = ?', 
+      ['active', timezoneOffset, session.id]);
 
     const lastEventStmt = db.prepare('SELECT * FROM activity_events WHERE day_session_id = ? ORDER BY timestamp DESC LIMIT 1');
     lastEventStmt.bind([session.id]);
