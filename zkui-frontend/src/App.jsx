@@ -508,8 +508,22 @@ function DayTracker({ session, items, onToast }) {
   const [showSummary, setShowSummary] = useState(false);
   const [summaryData, setSummaryData] = useState(null);
   const [employeeItems, setEmployeeItems] = useState([]);
+  const [employeeLocations, setEmployeeLocations] = useState([]);
   const [closedSession, setClosedSession] = useState(null);
   const [showResumeOptions, setShowResumeOptions] = useState(false);
+  const [pickerForm, setPickerForm] = useState({
+    itemId: '',
+    itemName: '',
+    projectId: '',
+    projectName: '',
+    clientId: '',
+    clientName: '',
+    locationId: '',
+    locationName: '',
+    issue: '',
+    comment: '',
+    billable: true
+  });
 
   const employeeId = session.employee.id;
   const assignedHours = session.employee.assignedHoursPerWeek || 40;
@@ -518,6 +532,7 @@ function DayTracker({ session, items, onToast }) {
   useEffect(() => {
     loadSession();
     loadEmployeeItems();
+    loadLocations();
   }, [employeeId]);
 
   async function loadEmployeeItems() {
@@ -527,6 +542,16 @@ function DayTracker({ session, items, onToast }) {
     } catch (err) {
       console.error('Failed to load employee items:', err);
       setEmployeeItems([]);
+    }
+  }
+
+  async function loadLocations() {
+    try {
+      const locs = await session.api.getLocations(employeeId);
+      setEmployeeLocations(locs || []);
+    } catch (err) {
+      console.error('Failed to load locations:', err);
+      setEmployeeLocations([]);
     }
   }
 
@@ -926,27 +951,151 @@ function DayTracker({ session, items, onToast }) {
           )}
         </div>
         {showPicker && (
-          <div style={styles.picker}>
-            {employeeItems.map(item => (
-              <div
-                key={item.id}
-                style={styles.pickerItem}
-                onClick={() => closedSession ? handleResumeSwitchToItem(item) : handleStartDay(item)}
-                onMouseEnter={(e) => e.currentTarget.style.background = 'rgba(255,255,255,.05)'}
-                onMouseLeave={(e) => e.currentTarget.style.background = 'transparent'}
+          <div style={{ ...styles.picker, position: 'relative', maxHeight: 'none', padding: 16 }}>
+            <div style={{ marginBottom: 12 }}>
+              <label style={{ fontSize: 10, color: '#555577', letterSpacing: '.1em', textTransform: 'uppercase', display: 'block', marginBottom: 4 }}>Item *</label>
+              <select 
+                className="input"
+                value={pickerForm.itemId}
+                onChange={(e) => {
+                  const item = employeeItems.find(i => i.id === parseInt(e.target.value));
+                  setPickerForm(f => ({
+                    ...f,
+                    itemId: e.target.value,
+                    itemName: item?.name || '',
+                    projectId: item?.projectId || '',
+                    projectName: item?.projectName || '',
+                    clientId: item?.clientId || '',
+                    clientName: item?.clientName || ''
+                  }));
+                }}
+                style={{ width: '100%' }}
               >
-                <span style={{ color: '#c0c0d8', fontSize: 12 }}>{item.name}</span>
-                <span style={{ color: '#555577', fontSize: 10 }}>{item.projectName}</span>
-              </div>
-            ))}
-            {employeeItems.length === 0 && (
-              <div style={{ padding: '10px 14px', color: '#555577', fontSize: 11 }}>
-                No items available
-              </div>
-            )}
-            <div style={{ ...styles.pickerItem, justifyContent: 'center', color: '#555577' }}
-                 onClick={() => { setShowPicker(false); setShowResumeOptions(false); }}>
-              Cancel
+                <option value="">Select an item...</option>
+                {employeeItems.map(item => (
+                  <option key={item.id} value={item.id}>{item.name} - {item.projectName}</option>
+                ))}
+              </select>
+            </div>
+            
+            <div style={{ marginBottom: 12 }}>
+              <label style={{ fontSize: 10, color: '#555577', letterSpacing: '.1em', textTransform: 'uppercase', display: 'block', marginBottom: 4 }}>Location</label>
+              <select 
+                className="input"
+                value={pickerForm.locationId}
+                onChange={(e) => {
+                  const loc = employeeLocations.find(l => l.id === parseInt(e.target.value));
+                  setPickerForm(f => ({
+                    ...f,
+                    locationId: e.target.value,
+                    locationName: loc?.name || ''
+                  }));
+                }}
+                style={{ width: '100%' }}
+              >
+                <option value="">Select a location...</option>
+                {employeeLocations.map(loc => (
+                  <option key={loc.id} value={loc.id}>{loc.name}</option>
+                ))}
+              </select>
+            </div>
+
+            <div style={{ marginBottom: 12 }}>
+              <label style={{ fontSize: 10, color: '#555577', letterSpacing: '.1em', textTransform: 'uppercase', display: 'block', marginBottom: 4 }}>Issue / Task</label>
+              <input 
+                className="input"
+                value={pickerForm.issue}
+                onChange={(e) => setPickerForm(f => ({ ...f, issue: e.target.value }))}
+                placeholder="e.g. BUG-123"
+                style={{ width: '100%' }}
+              />
+            </div>
+
+            <div style={{ marginBottom: 12 }}>
+              <label style={{ fontSize: 10, color: '#555577', letterSpacing: '.1em', textTransform: 'uppercase', display: 'block', marginBottom: 4 }}>Comment</label>
+              <textarea 
+                className="input"
+                value={pickerForm.comment}
+                onChange={(e) => setPickerForm(f => ({ ...f, comment: e.target.value }))}
+                placeholder="What are you working on?"
+                rows={2}
+                style={{ width: '100%', resize: 'vertical' }}
+              />
+            </div>
+
+            <div style={{ marginBottom: 16 }}>
+              <label style={{ display: 'flex', alignItems: 'center', gap: 8, cursor: 'pointer', fontSize: 12, color: '#8888aa' }}>
+                <input 
+                  type="checkbox" 
+                  checked={pickerForm.billable}
+                  onChange={(e) => setPickerForm(f => ({ ...f, billable: e.target.checked }))}
+                  style={{ accentColor: '#7EC8E3' }}
+                />
+                Billable
+              </label>
+            </div>
+
+            <div style={{ display: 'flex', gap: 8 }}>
+              <button 
+                className="btn btn-primary" 
+                onClick={() => {
+                  if (!pickerForm.itemId) {
+                    onToast?.("Please select an item", "err");
+                    return;
+                  }
+                  if (closedSession) {
+                    handleResumeSwitchToItem({
+                      id: parseInt(pickerForm.itemId),
+                      name: pickerForm.itemName,
+                      projectId: pickerForm.projectId,
+                      projectName: pickerForm.projectName,
+                      clientId: pickerForm.clientId,
+                      clientName: pickerForm.clientName,
+                      locationId: pickerForm.locationId ? parseInt(pickerForm.locationId) : null,
+                      locationName: pickerForm.locationName,
+                      issue: pickerForm.issue,
+                      comment: pickerForm.comment,
+                      billable: pickerForm.billable
+                    });
+                  } else {
+                    handleStartDay({
+                      id: parseInt(pickerForm.itemId),
+                      name: pickerForm.itemName,
+                      projectId: pickerForm.projectId,
+                      projectName: pickerForm.projectName,
+                      clientId: pickerForm.clientId,
+                      clientName: pickerForm.clientName,
+                      locationId: pickerForm.locationId ? parseInt(pickerForm.locationId) : null,
+                      locationName: pickerForm.locationName,
+                      issue: pickerForm.issue,
+                      comment: pickerForm.comment,
+                      billable: pickerForm.billable
+                    });
+                  }
+                  setPickerForm({
+                    itemId: '', itemName: '', projectId: '', projectName: '',
+                    clientId: '', clientName: '', locationId: '', locationName: '',
+                    issue: '', comment: '', billable: true
+                  });
+                }}
+                style={{ flex: 1 }}
+              >
+                {closedSession ? 'RESUME' : 'START'}
+              </button>
+              <button 
+                className="btn" 
+                onClick={() => { 
+                  setShowPicker(false); 
+                  setShowResumeOptions(false);
+                  setPickerForm({
+                    itemId: '', itemName: '', projectId: '', projectName: '',
+                    clientId: '', clientName: '', locationId: '', locationName: '',
+                    issue: '', comment: '', billable: true
+                  });
+                }}
+              >
+                Cancel
+              </button>
             </div>
           </div>
         )}
@@ -1028,35 +1177,142 @@ function DayTracker({ session, items, onToast }) {
       </div>
 
       {showPicker && (
-        <div style={styles.picker}>
-          {employeeItems.map(item => (
-            <div
-              key={item.id}
-              style={styles.pickerItem}
-              onClick={() => handlePush(item)}
-              onMouseEnter={(e) => e.currentTarget.style.background = 'rgba(255,255,255,.05)'}
-              onMouseLeave={(e) => e.currentTarget.style.background = 'transparent'}
-            >
-              <span style={{ color: '#c0c0d8', fontSize: 12 }}>{item.name}</span>
-              <span style={{ color: '#555577', fontSize: 10 }}>{item.projectName}</span>
+          <div style={{ ...styles.picker, position: 'relative', maxHeight: 'none', padding: 16 }}>
+            <div style={{ marginBottom: 12 }}>
+              <label style={{ fontSize: 10, color: '#555577', letterSpacing: '.1em', textTransform: 'uppercase', display: 'block', marginBottom: 4 }}>Item *</label>
+              <select 
+                className="input"
+                value={pickerForm.itemId}
+                onChange={(e) => {
+                  const item = employeeItems.find(i => i.id === parseInt(e.target.value));
+                  setPickerForm(f => ({
+                    ...f,
+                    itemId: e.target.value,
+                    itemName: item?.name || '',
+                    projectId: item?.projectId || '',
+                    projectName: item?.projectName || '',
+                    clientId: item?.clientId || '',
+                    clientName: item?.clientName || ''
+                  }));
+                }}
+                style={{ width: '100%' }}
+              >
+                <option value="">Select an item...</option>
+                {employeeItems.map(item => (
+                  <option key={item.id} value={item.id}>{item.name} - {item.projectName}</option>
+                ))}
+              </select>
             </div>
-          ))}
-          {employeeItems.length === 0 && (
-            <div style={{ padding: '10px 14px', color: '#555577', fontSize: 11 }}>
-              No items available
+            
+            <div style={{ marginBottom: 12 }}>
+              <label style={{ fontSize: 10, color: '#555577', letterSpacing: '.1em', textTransform: 'uppercase', display: 'block', marginBottom: 4 }}>Location</label>
+              <select 
+                className="input"
+                value={pickerForm.locationId}
+                onChange={(e) => {
+                  const loc = employeeLocations.find(l => l.id === parseInt(e.target.value));
+                  setPickerForm(f => ({
+                    ...f,
+                    locationId: e.target.value,
+                    locationName: loc?.name || ''
+                  }));
+                }}
+                style={{ width: '100%' }}
+              >
+                <option value="">Same as before...</option>
+                {employeeLocations.map(loc => (
+                  <option key={loc.id} value={loc.id}>{loc.name}</option>
+                ))}
+              </select>
             </div>
-          )}
-          <div style={{ ...styles.pickerItem, justifyContent: 'center', color: '#555577' }}
-               onClick={() => setShowPicker(false)}>
-            Cancel
-          </div>
-        </div>
-      )}
-    </div>
-  );
-}
 
-// ─── Entry Modal ──────────────────────────────────────────────────────────────
+            <div style={{ marginBottom: 12 }}>
+              <label style={{ fontSize: 10, color: '#555577', letterSpacing: '.1em', textTransform: 'uppercase', display: 'block', marginBottom: 4 }}>Issue / Task</label>
+              <input 
+                className="input"
+                value={pickerForm.issue}
+                onChange={(e) => setPickerForm(f => ({ ...f, issue: e.target.value }))}
+                placeholder="e.g. BUG-123"
+                style={{ width: '100%' }}
+              />
+            </div>
+
+            <div style={{ marginBottom: 12 }}>
+              <label style={{ fontSize: 10, color: '#555577', letterSpacing: '.1em', textTransform: 'uppercase', display: 'block', marginBottom: 4 }}>Comment</label>
+              <textarea 
+                className="input"
+                value={pickerForm.comment}
+                onChange={(e) => setPickerForm(f => ({ ...f, comment: e.target.value }))}
+                placeholder="What are you working on?"
+                rows={2}
+                style={{ width: '100%', resize: 'vertical' }}
+              />
+            </div>
+
+            <div style={{ marginBottom: 16 }}>
+              <label style={{ display: 'flex', alignItems: 'center', gap: 8, cursor: 'pointer', fontSize: 12, color: '#8888aa' }}>
+                <input 
+                  type="checkbox" 
+                  checked={pickerForm.billable}
+                  onChange={(e) => setPickerForm(f => ({ ...f, billable: e.target.checked }))}
+                  style={{ accentColor: '#7EC8E3' }}
+                />
+                Billable
+              </label>
+            </div>
+
+            <div style={{ display: 'flex', gap: 8 }}>
+              <button 
+                className="btn btn-primary" 
+                onClick={() => {
+                  if (!pickerForm.itemId) {
+                    onToast?.("Please select an item", "err");
+                    return;
+                  }
+                  handlePush({
+                    id: parseInt(pickerForm.itemId),
+                    name: pickerForm.itemName,
+                    projectId: pickerForm.projectId,
+                    projectName: pickerForm.projectName,
+                    clientId: pickerForm.clientId,
+                    clientName: pickerForm.clientName,
+                    locationId: pickerForm.locationId ? parseInt(pickerForm.locationId) : null,
+                    locationName: pickerForm.locationName,
+                    issue: pickerForm.issue,
+                    comment: pickerForm.comment,
+                    billable: pickerForm.billable
+                  });
+                  setPickerForm({
+                    itemId: '', itemName: '', projectId: '', projectName: '',
+                    clientId: '', clientName: '', locationId: '', locationName: '',
+                    issue: '', comment: '', billable: true
+                  });
+                }}
+                style={{ flex: 1 }}
+              >
+                SWITCH
+              </button>
+              <button 
+                className="btn" 
+                onClick={() => { 
+                  setShowPicker(false);
+                  setPickerForm({
+                    itemId: '', itemName: '', projectId: '', projectName: '',
+                    clientId: '', clientName: '', locationId: '', locationName: '',
+                    issue: '', comment: '', billable: true
+                  });
+                }}
+              >
+                Cancel
+              </button>
+            </div>
+          </div>
+        )}
+      </div>
+    );
+  }
+
+  // ─── Entry Modal ──────────────────────────────────────────────────────────────
 function EntryModal({ entry, timesheetId, refDate, api, clients, projects, items, locations, favourites, onSave, onSaveFavourite, onClose }) {
   const editing = !!entry?.id;
   const dateStr = todayPrefix(refDate);

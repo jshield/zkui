@@ -55,10 +55,25 @@ async function initDb() {
       project_name TEXT,
       client_id INTEGER,
       client_name TEXT,
+      location_id INTEGER,
+      location_name TEXT,
+      issue TEXT,
+      comment TEXT,
+      billable INTEGER DEFAULT 1,
       duration_seconds INTEGER DEFAULT 0,
       FOREIGN KEY (day_session_id) REFERENCES day_sessions(id)
     )
   `);
+
+  try {
+    db.run('ALTER TABLE activity_events ADD COLUMN location_id INTEGER');
+    db.run('ALTER TABLE activity_events ADD COLUMN location_name TEXT');
+    db.run('ALTER TABLE activity_events ADD COLUMN issue TEXT');
+    db.run('ALTER TABLE activity_events ADD COLUMN comment TEXT');
+    db.run('ALTER TABLE activity_events ADD COLUMN billable INTEGER DEFAULT 1');
+  } catch (e) {
+    // Columns may already exist
+  }
 
   saveDb();
 }
@@ -230,7 +245,13 @@ app.get('/api-local/day-sessions/:employeeId/closed', (req, res) => {
 
 app.post('/api-local/day-sessions/:employeeId', (req, res) => {
   const { employeeId } = req.params;
-  const { itemId, itemName, projectId, projectName, clientId, clientName, targetSeconds } = req.body;
+  const { 
+    itemId, itemName, projectId, projectName, 
+    clientId, clientName, 
+    locationId, locationName,
+    issue, comment, billable,
+    targetSeconds 
+  } = req.body;
   const date = getTodayDate();
   const now = new Date().toISOString();
 
@@ -252,9 +273,10 @@ app.post('/api-local/day-sessions/:employeeId', (req, res) => {
     const sessionId = lastIdStmt.getAsObject().id;
     lastIdStmt.free();
 
-    db.run(`INSERT INTO activity_events (day_session_id, timestamp, event_type, item_id, item_name, project_id, project_name, client_id, client_name)
-      VALUES (?, ?, 'start_day', ?, ?, ?, ?, ?, ?)`,
-      [sessionId, now, itemId, itemName, projectId, projectName, clientId, clientName]);
+    db.run(`INSERT INTO activity_events 
+      (day_session_id, timestamp, event_type, item_id, item_name, project_id, project_name, client_id, client_name, location_id, location_name, issue, comment, billable)
+      VALUES (?, ?, 'start_day', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [sessionId, now, itemId, itemName, projectId, projectName, clientId, clientName, locationId, locationName, issue || null, comment || null, billable !== false ? 1 : 0]);
 
     saveDb();
 
@@ -281,7 +303,12 @@ app.post('/api-local/day-sessions/:employeeId', (req, res) => {
 
 app.put('/api-local/day-sessions/:employeeId/push', (req, res) => {
   const { employeeId } = req.params;
-  const { itemId, itemName, projectId, projectName, clientId, clientName } = req.body;
+  const { 
+    itemId, itemName, projectId, projectName, 
+    clientId, clientName,
+    locationId, locationName,
+    issue, comment, billable
+  } = req.body;
   const date = getTodayDate();
   const now = new Date().toISOString();
 
@@ -316,9 +343,18 @@ app.put('/api-local/day-sessions/:employeeId/push', (req, res) => {
       }
     }
 
-    db.run(`INSERT INTO activity_events (day_session_id, timestamp, event_type, item_id, item_name, project_id, project_name, client_id, client_name)
-      VALUES (?, ?, 'push', ?, ?, ?, ?, ?, ?)`,
-      [session.id, now, itemId, itemName, projectId, projectName, clientId, clientName]);
+    const inheritLocation = locationId ? null : (lastEvent?.location_id ? {
+      location_id: lastEvent.location_id,
+      location_name: lastEvent.location_name
+    } : null);
+
+    db.run(`INSERT INTO activity_events 
+      (day_session_id, timestamp, event_type, item_id, item_name, project_id, project_name, client_id, client_name, location_id, location_name, issue, comment, billable)
+      VALUES (?, ?, 'push', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [session.id, now, itemId, itemName, projectId, projectName, clientId, clientName, 
+       locationId || inheritLocation?.location_id || null, 
+       locationName || inheritLocation?.location_name || null,
+       issue || null, comment || null, billable !== false ? 1 : 0]);
 
     saveDb();
 
@@ -395,8 +431,9 @@ app.put('/api-local/day-sessions/:employeeId/pop', (req, res) => {
 
     const returnToItem = startDayEvent || pushEvents[1] || null;
 
-    db.run(`INSERT INTO activity_events (day_session_id, timestamp, event_type, item_id, item_name, project_id, project_name, client_id, client_name)
-      VALUES (?, ?, 'pop', ?, ?, ?, ?, ?, ?)`,
+    db.run(`INSERT INTO activity_events 
+      (day_session_id, timestamp, event_type, item_id, item_name, project_id, project_name, client_id, client_name, location_id, location_name, issue, comment, billable)
+      VALUES (?, ?, 'pop', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         session.id, now,
         returnToItem?.item_id || null,
@@ -404,7 +441,12 @@ app.put('/api-local/day-sessions/:employeeId/pop', (req, res) => {
         returnToItem?.project_id || null,
         returnToItem?.project_name || null,
         returnToItem?.client_id || null,
-        returnToItem?.client_name || null
+        returnToItem?.client_name || null,
+        returnToItem?.location_id || null,
+        returnToItem?.location_name || null,
+        returnToItem?.issue || null,
+        returnToItem?.comment || null,
+        returnToItem?.billable !== 0 ? 1 : 0
       ]);
 
     saveDb();
@@ -583,6 +625,24 @@ app.put('/api-local/day-sessions/:employeeId/end', async (req, res) => {
 
     db.run('UPDATE day_sessions SET end_time = ?, status = ? WHERE id = ?', [now, 'closed', session.id]);
 
+    // Fetch timesheet to get TimesheetId
+    const timesheetDate = new Date().toISOString();
+    let timesheetId = null;
+    try {
+      const tsResponse = await fetch(`https://${targetHost}/api/Timesheets?employeeId=${employeeId}&referenceDate=${encodeURIComponent(timesheetDate)}&includeEntries=false`, {
+        method: 'GET',
+        headers: {
+          'Authorization': `Bearer ${authToken}`
+        }
+      });
+      if (tsResponse.ok) {
+        const timesheet = await tsResponse.json();
+        timesheetId = timesheet?.id;
+      }
+    } catch (e) {
+      console.error('Failed to fetch timesheet:', e);
+    }
+
     const eventsStmt = db.prepare('SELECT * FROM activity_events WHERE day_session_id = ? AND item_id IS NOT NULL AND duration_seconds > 0 ORDER BY timestamp ASC');
     eventsStmt.bind([session.id]);
     const events = [];
@@ -591,28 +651,50 @@ app.put('/api-local/day-sessions/:employeeId/end', async (req, res) => {
     }
     eventsStmt.free();
 
-    const entries = events.map(event => ({
-      id: 0,
-      description: event.item_name || 'Work',
-      taskIssue: null,
-      comment: null,
-      billable: true,
-      breakTime: false,
-      startTime: null,
-      endTime: null,
-      adminComment: null,
-      duration: `PT${event.duration_seconds}S`,
-      unallocatedTime: false,
-      itemId: event.item_id,
-      itemName: event.item_name,
-      projectId: event.project_id,
-      projectName: event.project_name,
-      clientId: event.client_id,
-      clientName: event.client_name,
-      locationId: null,
-      locationName: null,
-      timesheetId: null
-    }));
+    // Calculate start and end times for each entry
+    let currentTime = new Date(session.start_time).getTime();
+    
+    const formatDateTime = (timestamp) => {
+      const d = new Date(timestamp);
+      const pad = (n) => String(n).padStart(2, '0');
+      return `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+    };
+    
+    const formatDuration = (seconds) => {
+      const h = Math.floor(seconds / 3600);
+      const m = Math.floor((seconds % 3600) / 60);
+      const s = seconds % 60;
+      return `${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`;
+    };
+
+    const entries = events.map(event => {
+      const startTime = new Date(currentTime);
+      const endTime = new Date(currentTime + event.duration_seconds * 1000);
+      currentTime = endTime.getTime();
+      
+      return {
+        Id: 0,
+        Description: event.item_name || 'Work',
+        TaskIssue: event.issue || null,
+        Comment: event.comment || null,
+        Billable: event.billable !== 0,
+        BreakTime: false,
+        StartTime: formatDateTime(startTime),
+        EndTime: formatDateTime(endTime),
+        AdminComment: null,
+        Duration: formatDuration(event.duration_seconds),
+        UnallocatedTime: false,
+        ItemId: event.item_id,
+        ItemName: event.item_name,
+        ProjectId: event.project_id,
+        ProjectName: event.project_name,
+        ClientId: event.client_id,
+        ClientName: event.client_name,
+        LocationId: event.location_id,
+        LocationName: event.location_name,
+        TimesheetId: timesheetId
+      };
+    });
 
     const createdEntries = [];
     for (const entry of entries) {
@@ -662,7 +744,12 @@ app.put('/api-local/day-sessions/:employeeId/end', async (req, res) => {
 
 app.put('/api-local/day-sessions/:employeeId/reopen', (req, res) => {
   const { employeeId } = req.params;
-  const { itemId, itemName, projectId, projectName, clientId, clientName } = req.body || {};
+  const { 
+    itemId, itemName, projectId, projectName, 
+    clientId, clientName,
+    locationId, locationName,
+    issue, comment, billable
+  } = req.body || {};
   const date = getTodayDate();
   const now = new Date().toISOString();
 
@@ -689,18 +776,29 @@ app.put('/api-local/day-sessions/:employeeId/reopen', (req, res) => {
       project_id: projectId,
       project_name: projectName,
       client_id: clientId,
-      client_name: clientName
+      client_name: clientName,
+      location_id: locationId,
+      location_name: locationName,
+      issue: issue,
+      comment: comment,
+      billable: billable
     } : (lastEvent?.item_id ? {
       item_id: lastEvent.item_id,
       item_name: lastEvent.item_name,
       project_id: lastEvent.project_id,
       project_name: lastEvent.project_name,
       client_id: lastEvent.client_id,
-      client_name: lastEvent.client_name
+      client_name: lastEvent.client_name,
+      location_id: lastEvent.location_id,
+      location_name: lastEvent.location_name,
+      issue: lastEvent.issue,
+      comment: lastEvent.comment,
+      billable: lastEvent.billable
     } : null);
 
-    db.run(`INSERT INTO activity_events (day_session_id, timestamp, event_type, item_id, item_name, project_id, project_name, client_id, client_name)
-      VALUES (?, ?, 'reopen_day', ?, ?, ?, ?, ?, ?)`,
+    db.run(`INSERT INTO activity_events 
+      (day_session_id, timestamp, event_type, item_id, item_name, project_id, project_name, client_id, client_name, location_id, location_name, issue, comment, billable)
+      VALUES (?, ?, 'reopen_day', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         session.id, now,
         resumeToItem?.item_id || null,
@@ -708,7 +806,12 @@ app.put('/api-local/day-sessions/:employeeId/reopen', (req, res) => {
         resumeToItem?.project_id || null,
         resumeToItem?.project_name || null,
         resumeToItem?.client_id || null,
-        resumeToItem?.client_name || null
+        resumeToItem?.client_name || null,
+        resumeToItem?.location_id || null,
+        resumeToItem?.location_name || null,
+        resumeToItem?.issue || null,
+        resumeToItem?.comment || null,
+        resumeToItem?.billable !== 0 ? 1 : 0
       ]);
 
     saveDb();
