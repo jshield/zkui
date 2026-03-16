@@ -9,6 +9,7 @@ on:
     branches: [master]
     paths:
       - 'zkui-frontend/**'
+  workflow_dispatch:
 
 jobs:
   web:
