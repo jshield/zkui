@@ -1,6 +1,8 @@
 import { useState, useRef, useEffect, useCallback } from "react";
 import { loadConfig } from "./configService";
-import { requestDeviceCode, pollForToken, refreshAccessToken } from "./authService";
+import { requestDeviceCode, pollForToken, refreshAccessToken, saveAuthTokens, loadAuthTokens } from "./authService";
+import { ApiService, setApiBaseUrl, setAccessToken, isCapacitor } from "./services/ApiService";
+import { LocalDbService, initLocalDb } from "./services/LocalDbService";
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 const CLIENT_COLORS = ["#FF6B6B","#FF8E53","#FFC857","#A8E6CF","#7EC8E3","#B388FF","#F48FB1","#80DEEA"];
@@ -125,6 +127,12 @@ const CSS = `
 
 // ─── API client ───────────────────────────────────────────────────────────────
 function makeApi(baseUrl, token, sessionRefArg = null, onTokenRefresh = null) {
+  if (isCapacitor()) {
+    setApiBaseUrl(baseUrl);
+    setAccessToken(token);
+    return ApiService;
+  }
+
   const base = baseUrl.replace(/\/$/, "");
   const getHeaders = () => {
     const h = new Headers();
@@ -187,6 +195,10 @@ function makeApi(baseUrl, token, sessionRefArg = null, onTokenRefresh = null) {
 }
 
 function makeLocalApi() {
+  if (isCapacitor()) {
+    return LocalDbService;
+  }
+  
   const base = "";
   return {
     getDaySession: (employeeId) =>
@@ -328,6 +340,18 @@ function LoginScreen({ onLogin }) {
         const expiresAt = Date.now() + (tokenResponse.expires_in * 1000);
 
         const api = makeApi(url.trim(), tokenResponse.access_token);
+        
+        if (isCapacitor()) {
+          await setApiBaseUrl(url.trim());
+          await saveAuthTokens(
+            tokenResponse.access_token,
+            tokenResponse.refresh_token,
+            config.tenantId,
+            config.clientId,
+            config.scope
+          );
+        }
+
         let employee;
         if (empId.trim()) {
           employee = await api.getEmployee(parseInt(empId.trim()));
@@ -1861,6 +1885,15 @@ export default function App() {
   const [leaveEntries, setLeaveEntries] = useState([]);
   const [leaveTypes, setLeaveTypes] = useState([]);
   const [refreshing, setRefreshing] = useState(false);
+  const [dbReady, setDbReady] = useState(false);
+
+  useEffect(() => {
+    if (isCapacitor() && !dbReady) {
+      initLocalDb().then(() => setDbReady(true)).catch(console.error);
+    } else {
+      setDbReady(true);
+    }
+  }, []);
 
   useEffect(() => {
     sessionRef.current = session;

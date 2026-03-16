@@ -11,12 +11,17 @@
     "start": "node server.cjs"
   },
   "dependencies": {
-    "sql.js": "^1.11.0",
+    "@capacitor/android": "^8.2.0",
+    "@capacitor/cli": "^8.2.0",
+    "@capacitor/core": "^8.2.0",
+    "@capacitor/ios": "^8.2.0",
+    "@capacitor/preferences": "^8.0.1",
     "express": "^5.2.1",
     "express-http-proxy": "^2.1.2",
     "http-proxy-middleware": "^3.0.5",
     "react": "^19.2.0",
-    "react-dom": "^19.2.0"
+    "react-dom": "^19.2.0",
+    "sql.js": "^1.11.0"
   },
   "devDependencies": {
     "@eslint/js": "^9.39.1",
