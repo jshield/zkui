@@ -2,11 +2,11 @@ name: Build
 
 on:
   push:
-    branches: [main]
+    branches: [master]
     paths:
       - 'zkui-frontend/**'
   pull_request:
-    branches: [main]
+    branches: [master]
     paths:
       - 'zkui-frontend/**'
 
